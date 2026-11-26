@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ============================================================
-KHELV DATA HISTORY BOT V2.0
-WinGo 1 Minute | Telegram Rolling JSON Broadcaster
+KHELV DATA HISTORY BOT V2.1
+WinGo 1 Minute | Telegram Formatted History Broadcaster
 No Prediction | No AI | No Fake Results
 Single File Deployment
 ============================================================
@@ -33,7 +33,7 @@ PORT = int(os.getenv("PORT", "8080"))
 DB_PATH = os.getenv("DB_PATH", "history.db")
 MAX_HISTORY = 5000
 
-# Telegram message limit is 4096 chars; keep safe margin for <pre> tags & formatting
+# Telegram message limit is 4096 chars; keep safe margin
 MAX_TG_TEXT_LEN = int(os.getenv("MAX_TG_TEXT_LEN", "3900"))
 
 HEADERS = {
@@ -242,6 +242,17 @@ def mark_broadcasted(period, tg_message_id):
         conn.close()
 
 
+def is_period_already_broadcasted(period):
+    with db_lock:
+        conn = db_connect()
+        row = conn.execute(
+            "SELECT broadcasted FROM history WHERE period = ?",
+            (period,)
+        ).fetchone()
+        conn.close()
+        return bool(row and row["broadcasted"] == 1)
+
+
 def seed_initial_history(results):
     """First startup: Save current API history without broadcasting old results."""
     for record in results:
@@ -328,11 +339,28 @@ def close_batch(batch_id):
         conn.commit()
         conn.close()
 
-# ================= TELEGRAM =================
+# ================= TELEGRAM FORMATTING =================
 
-def format_json_message(records_list):
-    message_json = json.dumps(records_list, ensure_ascii=False, indent=2)
-    return "<pre>" + html.escape(message_json) + "</pre>"
+def format_row(rec):
+    period = str(rec["period"])
+    num = str(rec["number"])
+    size = f"{rec['big_small']:<5}"
+    colors = ", ".join(rec["color"]) if isinstance(rec["color"], list) else str(rec["color"])
+    return f"{period} | {num} | {size} | {colors}"
+
+
+def format_history_message(records_list):
+    lines = [
+        "WIN GO 1M | RESULT HISTORY",
+        "Period            | Num | Size  | Color",
+        "-----------------------------------------"
+    ]
+    for rec in records_list:
+        lines.append(format_row(rec))
+    lines.append("-----------------------------------------")
+    lines.append(f"Total Entries: {len(records_list)}")
+    body = "\n".join(lines)
+    return "<pre>" + html.escape(body) + "</pre>"
 
 
 def tg_api_call(method, payload):
@@ -356,14 +384,14 @@ def telegram_send_new_message(records_list):
     # No reply_markup / buttons included
     payload = {
         "chat_id": CHANNEL_ID,
-        "text": format_json_message(records_list),
+        "text": format_history_message(records_list),
         "parse_mode": "HTML"
     }
     try:
         result = tg_api_call("sendMessage", payload)
         if result.get("ok") is True and isinstance(result.get("result"), dict):
             msg_id = result["result"].get("message_id")
-            log.info("Telegram new batch message sent (msg_id=%s, count=%s)", msg_id, len(records_list))
+            log.info("Telegram new message sent (msg_id=%s, entries=%s)", msg_id, len(records_list))
             return msg_id
         log.error("Telegram sendMessage rejected: %s", result)
     except Exception as error:
@@ -380,13 +408,13 @@ def telegram_edit_message(message_id, records_list):
     payload = {
         "chat_id": CHANNEL_ID,
         "message_id": message_id,
-        "text": format_json_message(records_list),
+        "text": format_history_message(records_list),
         "parse_mode": "HTML"
     }
     try:
         result = tg_api_call("editMessageText", payload)
         if result.get("ok") is True:
-            log.info("Telegram batch updated (msg_id=%s, count=%s)", message_id, len(records_list))
+            log.info("Telegram message updated (msg_id=%s, entries=%s)", message_id, len(records_list))
             return True
         desc = str(result.get("description", ""))
         if "message is not modified" in desc.lower():
@@ -400,9 +428,8 @@ def telegram_edit_message(message_id, records_list):
 
 def append_record_to_telegram(record):
     """
-    Appends record to active Telegram message if within MAX_TG_TEXT_LEN.
-    If limit exceeded, closes current message and starts a fresh message with this record.
-    Returns tg_message_id on success, or None on failure.
+    Appends unique record to active Telegram message while under MAX_TG_TEXT_LEN.
+    Starts a fresh message once limit is reached so results never repeat.
     """
     active = get_active_batch()
 
@@ -414,8 +441,13 @@ def append_record_to_telegram(record):
         create_batch(msg_id, new_records)
         return msg_id
 
+    existing_periods = {str(r.get("period")) for r in active["records"]}
+    if str(record["period"]) in existing_periods:
+        log.info("Skipped duplicate period in active batch: %s", record["period"])
+        return active["message_id"]
+
     candidate_records = active["records"] + [record]
-    candidate_text = format_json_message(candidate_records)
+    candidate_text = format_history_message(candidate_records)
 
     if len(candidate_text) <= MAX_TG_TEXT_LEN:
         ok = telegram_edit_message(active["message_id"], candidate_records)
@@ -424,23 +456,23 @@ def append_record_to_telegram(record):
         update_batch_records(active["id"], candidate_records)
         return active["message_id"]
 
-    # Current message reached safe length limit -> close it and start new message
     close_batch(active["id"])
     new_records = [record]
     new_msg_id = telegram_send_new_message(new_records)
     if new_msg_id is None:
         return None
     create_batch(new_msg_id, new_records)
-    log.info("Started new Telegram JSON message (msg_id=%s) after hitting length limit", new_msg_id)
+    log.info("Started fresh Telegram message (msg_id=%s) after character limit", new_msg_id)
     return new_msg_id
 
 
 def process_pending():
     pending = get_pending_results()
     for record in pending:
+        if is_period_already_broadcasted(record["period"]):
+            continue
         msg_id = append_record_to_telegram(record)
         if msg_id is None:
-            # Keep pending for retry on next poll
             break
         mark_broadcasted(record["period"], msg_id)
 
@@ -540,7 +572,7 @@ def main():
     web_thread.start()
 
     log.info("====================================")
-    log.info("KHELV DATA HISTORY BOT V2.0")
+    log.info("KHELV DATA HISTORY BOT V2.1")
     log.info("GAME: WinGo 1 Minute")
     log.info("PREDICTION: DISABLED")
     log.info("AI: DISABLED")
