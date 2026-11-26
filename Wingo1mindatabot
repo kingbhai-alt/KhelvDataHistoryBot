@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-============================================================
-KHELV DATA HISTORY BOT V2.2
-WinGo 1 Minute | Clean Rolling History Broadcaster
-No Prediction | No AI | No Fake Results
-Single File Deployment
-============================================================
+KHELV DATA HISTORY BOT (Fresh Scratch Build)
+WinGo 1M | Rolling Telegram History Broadcaster
+No Prediction | No AI | No JSON | No Buttons
 """
 
 import os
@@ -19,10 +16,10 @@ import urllib.request
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# ================= CONFIGURATION =================
+# ================= ENV CONFIG =================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9110025108:AAHtWMpg6BkgQ5ri8abKG5C6m42cdulTJZA").strip()
-CHANNEL_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003811055440").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003811055440").strip()
 API_URL = os.getenv(
     "API_URL",
     "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
@@ -30,12 +27,9 @@ API_URL = os.getenv(
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
 PORT = int(os.getenv("PORT", "8080"))
-DB_PATH = os.getenv("DB_PATH", "history.db")
-RESET_DB = os.getenv("RESET_DB", "0").strip().lower() in ("1", "true", "yes")
-MAX_HISTORY = 5000
-
-# Keep safely below Telegram's 4096 character limit
-MAX_TG_TEXT_LEN = int(os.getenv("MAX_TG_TEXT_LEN", "3800"))
+DB_FILE = os.getenv("DB_FILE", "wingo_history.db")
+MAX_CHARS = int(os.getenv("MAX_CHARS", "3850"))
+FRESH_START = os.getenv("FRESH_START", "0").strip().lower() in ("1", "true", "yes")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Safari/537.36",
@@ -47,60 +41,50 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-log = logging.getLogger("KHELV-DATA-BOT")
+log = logging.getLogger("WINGO-BOT")
 
-db_lock = threading.RLock()
+lock = threading.RLock()
 
-# ================= DATABASE =================
+# ================= DB LAYER =================
 
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+def get_conn():
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_database():
-    with db_lock:
-        if RESET_DB and os.path.exists(DB_PATH):
-            try:
-                os.remove(DB_PATH)
-                log.warning("RESET_DB enabled: removed existing database %s", DB_PATH)
-            except Exception as e:
-                log.error("Failed to remove %s: %s", DB_PATH, e)
+def setup_db():
+    with lock:
+        if FRESH_START and os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+            log.warning("FRESH_START active: old DB removed (%s)", DB_FILE)
 
-        conn = db_connect()
+        conn = get_conn()
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS history (
+            CREATE TABLE IF NOT EXISTS results (
                 period TEXT PRIMARY KEY,
                 number INTEGER NOT NULL,
-                big_small TEXT NOT NULL,
+                size TEXT NOT NULL,
                 color TEXT NOT NULL,
-                broadcasted INTEGER DEFAULT 0,
-                tg_message_id INTEGER,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                sent INTEGER DEFAULT 0
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS tg_batches (
+            CREATE TABLE IF NOT EXISTS active_msg (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
-                records_json TEXT NOT NULL,
-                is_closed INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                items_json TEXT NOT NULL,
+                closed INTEGER DEFAULT 0
             )
         """)
         conn.commit()
         conn.close()
-        log.info("SQLite database initialized (V2.2)")
+        log.info("Database ready: %s", DB_FILE)
 
-# ================= RESULT PROCESSOR =================
+# ================= GAME DATA PARSER =================
 
-def get_color(number):
-    """
-    0 = Red + Violet
-    5 = Green + Violet
-    """
-    mapping = {
+def map_color(num):
+    colors = {
         0: ["Red", "Violet"],
         1: ["Green"],
         2: ["Red"],
@@ -112,31 +96,29 @@ def get_color(number):
         8: ["Red"],
         9: ["Green"]
     }
-    return mapping[number]
+    return colors[num]
 
 
-def extract_api_list(data):
-    if isinstance(data, dict):
-        if isinstance(data.get("data"), dict):
-            result = data["data"].get("list")
-            if isinstance(result, list):
-                return result
-        if isinstance(data.get("data"), list):
-            return data["data"]
-        if isinstance(data.get("list"), list):
-            return data["list"]
-        if isinstance(data.get("result"), list):
-            return data["result"]
-    if isinstance(data, list):
-        return data
+def pull_raw_list(payload):
+    if isinstance(payload, dict):
+        if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("list"), list):
+            return payload["data"]["list"]
+        if isinstance(payload.get("data"), list):
+            return payload["data"]
+        if isinstance(payload.get("list"), list):
+            return payload["list"]
+        if isinstance(payload.get("result"), list):
+            return payload["result"]
+    if isinstance(payload, list):
+        return payload
     return []
 
 
-def normalize_result(item):
-    if not isinstance(item, dict):
+def clean_row(raw):
+    if not isinstance(raw, dict):
         return None
-    period = item.get("issueNumber") or item.get("issue") or item.get("period")
-    number = item.get("number")
+    period = raw.get("issueNumber") or raw.get("issue") or raw.get("period")
+    number = raw.get("number")
     if period is None or number is None:
         return None
 
@@ -149,153 +131,126 @@ def normalize_result(item):
     if not period or number < 0 or number > 9:
         return None
 
-    big_small = "Big" if number >= 5 else "Small"
+    size = "Big" if number >= 5 else "Small"
 
-    raw_color = item.get("color")
+    raw_color = raw.get("color")
     if isinstance(raw_color, list) and raw_color:
-        color = [str(x).strip().capitalize() for x in raw_color]
+        color = [str(c).strip().capitalize() for c in raw_color if str(c).strip()]
     elif isinstance(raw_color, str) and raw_color.strip():
-        color = [x.strip().capitalize() for x in raw_color.replace(",", " ").split()]
+        color = [c.strip().capitalize() for c in raw_color.replace(",", " ").split() if c.strip()]
     else:
-        color = get_color(number)
+        color = map_color(number)
 
-    if not color or any(not x for x in color):
+    if not color:
         return None
 
     return {
         "period": period,
         "number": number,
-        "big_small": big_small,
+        "size": size,
         "color": color
     }
 
-# ================= FETCH GAME API =================
 
-def fetch_game_data():
-    request = urllib.request.Request(API_URL, headers=HEADERS)
-    with urllib.request.urlopen(request, timeout=15) as response:
-        if response.status != 200:
-            raise RuntimeError(f"Game API HTTP {response.status}")
-        raw = response.read().decode("utf-8")
-        data = json.loads(raw)
+def fetch_results():
+    req = urllib.request.Request(API_URL, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status}")
+        data = json.loads(resp.read().decode("utf-8"))
 
-    raw_list = extract_api_list(data)
-    results = []
-    for item in raw_list:
-        result = normalize_result(item)
-        if result:
-            results.append(result)
-    return results
+    out = []
+    for item in pull_raw_list(data):
+        parsed = clean_row(item)
+        if parsed:
+            out.append(parsed)
+    return out
 
-# ================= DATABASE OPERATIONS =================
+# ================= DB QUERIES =================
 
-def save_result(record, broadcasted=0):
-    with db_lock:
-        conn = db_connect()
-        cursor = conn.execute("""
-            INSERT OR IGNORE INTO history (period, number, big_small, color, broadcasted)
+def has_any_data():
+    with lock:
+        conn = get_conn()
+        cnt = conn.execute("SELECT COUNT(*) AS c FROM results").fetchone()["c"]
+        conn.close()
+        return cnt > 0
+
+
+def insert_result(row, sent=0):
+    with lock:
+        conn = get_conn()
+        conn.execute("""
+            INSERT OR IGNORE INTO results (period, number, size, color, sent)
             VALUES (?, ?, ?, ?, ?)
-        """, (
-            record["period"],
-            record["number"],
-            record["big_small"],
-            json.dumps(record["color"]),
-            broadcasted
-        ))
-        inserted = cursor.rowcount == 1
+        """, (row["period"], row["number"], row["size"], json.dumps(row["color"]), sent))
         conn.commit()
         conn.close()
-        return inserted
 
 
-def database_is_empty():
-    with db_lock:
-        conn = db_connect()
-        row = conn.execute("SELECT COUNT(*) AS total FROM history").fetchone()
-        conn.close()
-        return row["total"] == 0
+def seed_old_results(rows):
+    for r in rows:
+        insert_result(r, sent=1)
+    log.info("Seeded initial %s history rows without broadcasting", len(rows))
 
 
-def get_pending_results():
-    with db_lock:
-        conn = db_connect()
+def get_unsent():
+    with lock:
+        conn = get_conn()
         rows = conn.execute("""
-            SELECT period, number, big_small, color
-            FROM history
-            WHERE broadcasted = 0
+            SELECT period, number, size, color
+            FROM results
+            WHERE sent = 0
             ORDER BY period ASC
         """).fetchall()
         conn.close()
         return [
             {
-                "period": row["period"],
-                "number": row["number"],
-                "big_small": row["big_small"],
-                "color": json.loads(row["color"])
+                "period": x["period"],
+                "number": x["number"],
+                "size": x["size"],
+                "color": json.loads(x["color"])
             }
-            for row in rows
+            for x in rows
         ]
 
 
-def mark_broadcasted(period, tg_message_id):
-    with db_lock:
-        conn = db_connect()
-        conn.execute("""
-            UPDATE history
-            SET broadcasted = 1, tg_message_id = ?
-            WHERE period = ?
-        """, (tg_message_id, period))
+def mark_sent(period):
+    with lock:
+        conn = get_conn()
+        conn.execute("UPDATE results SET sent = 1 WHERE period = ?", (period,))
         conn.commit()
         conn.close()
 
 
-def is_period_already_broadcasted(period):
-    with db_lock:
-        conn = db_connect()
-        row = conn.execute(
-            "SELECT broadcasted FROM history WHERE period = ?",
-            (period,)
-        ).fetchone()
-        conn.close()
-        return bool(row and row["broadcasted"] == 1)
-
-
-def seed_initial_history(results):
-    """First startup: Save current API history without broadcasting old results."""
-    for record in results:
-        save_result(record, broadcasted=1)
-    log.info("Initial history saved: %s records", len(results))
-
-
-def get_history(limit=100):
-    limit = max(1, min(int(limit), MAX_HISTORY))
-    with db_lock:
-        conn = db_connect()
+def get_latest_list(limit=100):
+    limit = max(1, min(int(limit), 5000))
+    with lock:
+        conn = get_conn()
         rows = conn.execute("""
-            SELECT period, number, big_small, color
-            FROM history
+            SELECT period, number, size, color
+            FROM results
             ORDER BY period DESC
             LIMIT ?
         """, (limit,)).fetchall()
         conn.close()
         return [
             {
-                "period": row["period"],
-                "number": row["number"],
-                "big_small": row["big_small"],
-                "color": json.loads(row["color"])
+                "period": x["period"],
+                "number": x["number"],
+                "size": x["size"],
+                "color": json.loads(x["color"])
             }
-            for row in rows
+            for x in rows
         ]
 
 
-def get_active_batch():
-    with db_lock:
-        conn = db_connect()
+def get_open_batch():
+    with lock:
+        conn = get_conn()
         row = conn.execute("""
-            SELECT id, message_id, records_json, is_closed
-            FROM tg_batches
-            WHERE is_closed = 0
+            SELECT id, message_id, items_json
+            FROM active_msg
+            WHERE closed = 0
             ORDER BY id DESC
             LIMIT 1
         """).fetchone()
@@ -305,281 +260,206 @@ def get_active_batch():
         return {
             "id": row["id"],
             "message_id": row["message_id"],
-            "records": json.loads(row["records_json"]),
-            "is_closed": row["is_closed"]
+            "items": json.loads(row["items_json"])
         }
 
 
-def create_batch(message_id, records):
-    with db_lock:
-        conn = db_connect()
-        cursor = conn.execute("""
-            INSERT INTO tg_batches (message_id, records_json, is_closed)
+def save_new_batch(message_id, items):
+    with lock:
+        conn = get_conn()
+        cur = conn.execute("""
+            INSERT INTO active_msg (message_id, items_json, closed)
             VALUES (?, ?, 0)
-        """, (message_id, json.dumps(records, ensure_ascii=False)))
-        batch_id = cursor.lastrowid
+        """, (message_id, json.dumps(items, ensure_ascii=False)))
+        bid = cur.lastrowid
         conn.commit()
         conn.close()
-        return batch_id
+        return bid
 
 
-def update_batch_records(batch_id, records):
-    with db_lock:
-        conn = db_connect()
-        conn.execute("""
-            UPDATE tg_batches
-            SET records_json = ?
-            WHERE id = ?
-        """, (json.dumps(records, ensure_ascii=False), batch_id))
-        conn.commit()
-        conn.close()
-
-
-def close_batch(batch_id):
-    with db_lock:
-        conn = db_connect()
-        conn.execute("""
-            UPDATE tg_batches
-            SET is_closed = 1
-            WHERE id = ?
-        """, (batch_id,))
+def save_batch_items(batch_id, items):
+    with lock:
+        conn = get_conn()
+        conn.execute(
+            "UPDATE active_msg SET items_json = ? WHERE id = ?",
+            (json.dumps(items, ensure_ascii=False), batch_id)
+        )
         conn.commit()
         conn.close()
 
-# ================= TELEGRAM FORMATTING =================
 
-def format_entry(idx, rec):
-    period = html.escape(str(rec["period"]))
-    num = html.escape(str(rec["number"]))
-    size = html.escape(str(rec["big_small"]))
-    colors = ", ".join(rec["color"]) if isinstance(rec["color"], list) else str(rec["color"])
-    colors_esc = html.escape(colors)
-    return (
-        f"{idx}. Period: <b>{period}</b>\n"
-        f"    Number: <b>{num}</b> | Size: <b>{size}</b> | Color: <b>{colors_esc}</b>"
-    )
+def close_old_batch(batch_id):
+    with lock:
+        conn = get_conn()
+        conn.execute("UPDATE active_msg SET closed = 1 WHERE id = ?", (batch_id,))
+        conn.commit()
+        conn.close()
+
+# ================= TELEGRAM BROADCASTER =================
+
+def build_text(items):
+    lines = ["<b>WIN GO 1M HISTORY</b>", ""]
+    for idx, item in enumerate(items, start=1):
+        p = html.escape(str(item["period"]))
+        n = html.escape(str(item["number"]))
+        s = html.escape(str(item["size"]))
+        c = html.escape(", ".join(item["color"]))
+        lines.append(f"{idx}. Period: <b>{p}</b>")
+        lines.append(f"   Num: <b>{n}</b> | Size: <b>{s}</b> | Color: <b>{c}</b>")
+    lines.append("")
+    lines.append(f"Total: <b>{len(items)}</b>")
+    return "\n".join(lines)
 
 
-def format_history_message(records_list):
-    header = "<b>WIN GO 1M — LIVE RESULT LOG</b>\n━━━━━━━━━━━━━━━━━━━━━━"
-    entries = [format_entry(i + 1, rec) for i, rec in enumerate(records_list)]
-    footer = f"━━━━━━━━━━━━━━━━━━━━━━\nTotal Records: <b>{len(records_list)}</b>"
-    return header + "\n" + "\n\n".join(entries) + "\n" + footer
-
-
-def tg_api_call(method, payload):
+def call_tg(method, data):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    body = urllib.parse.urlencode(payload).encode("utf-8")
-    request = urllib.request.Request(
+    encoded = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(
         url,
-        data=body,
+        data=encoded,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST"
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
-def telegram_send_new_message(records_list):
-    if not BOT_TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN is missing")
-        return None
-
+def send_tg_message(items):
     payload = {
-        "chat_id": CHANNEL_ID,
-        "text": format_history_message(records_list),
+        "chat_id": CHAT_ID,
+        "text": build_text(items),
         "parse_mode": "HTML"
     }
-    try:
-        result = tg_api_call("sendMessage", payload)
-        if result.get("ok") is True and isinstance(result.get("result"), dict):
-            msg_id = result["result"].get("message_id")
-            log.info("Telegram new message sent (msg_id=%s, entries=%s)", msg_id, len(records_list))
-            return msg_id
-        log.error("Telegram sendMessage rejected: %s", result)
-    except Exception as error:
-        log.error("Telegram sendMessage error: %s", error)
+    res = call_tg("sendMessage", payload)
+    if res.get("ok") and isinstance(res.get("result"), dict):
+        return res["result"].get("message_id")
+    log.error("sendMessage failed: %s", res)
     return None
 
 
-def telegram_edit_message(message_id, records_list):
-    if not BOT_TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN is missing")
-        return False
-
+def edit_tg_message(message_id, items):
     payload = {
-        "chat_id": CHANNEL_ID,
+        "chat_id": CHAT_ID,
         "message_id": message_id,
-        "text": format_history_message(records_list),
+        "text": build_text(items),
         "parse_mode": "HTML"
     }
-    try:
-        result = tg_api_call("editMessageText", payload)
-        if result.get("ok") is True:
-            log.info("Telegram message updated (msg_id=%s, entries=%s)", message_id, len(records_list))
-            return True
-        desc = str(result.get("description", ""))
-        if "message is not modified" in desc.lower():
-            return True
-        log.error("Telegram editMessageText rejected: %s", result)
-    except Exception as error:
-        log.error("Telegram editMessageText error: %s", error)
+    res = call_tg("editMessageText", payload)
+    if res.get("ok"):
+        return True
+    if "message is not modified" in str(res.get("description", "")).lower():
+        return True
+    log.error("editMessageText failed: %s", res)
     return False
 
-# ================= BROADCAST PROCESSOR =================
 
-def append_record_to_telegram(record):
-    active = get_active_batch()
+def push_record(record):
+    batch = get_open_batch()
 
-    if active is None:
-        new_records = [record]
-        msg_id = telegram_send_new_message(new_records)
-        if msg_id is None:
-            return None
-        create_batch(msg_id, new_records)
-        return msg_id
+    if batch is None:
+        items = [record]
+        msg_id = send_tg_message(items)
+        if not msg_id:
+            return False
+        save_new_batch(msg_id, items)
+        return True
 
-    existing_periods = {str(r.get("period")) for r in active["records"]}
-    if str(record["period"]) in existing_periods:
-        log.info("Skipped duplicate period in active batch: %s", record["period"])
-        return active["message_id"]
+    seen = {str(x.get("period")) for x in batch["items"]}
+    if str(record["period"]) in seen:
+        return True
 
-    candidate_records = active["records"] + [record]
-    candidate_text = format_history_message(candidate_records)
+    updated_items = batch["items"] + [record]
+    if len(build_text(updated_items)) <= MAX_CHARS:
+        if not edit_tg_message(batch["message_id"], updated_items):
+            return False
+        save_batch_items(batch["id"], updated_items)
+        return True
 
-    if len(candidate_text) <= MAX_TG_TEXT_LEN:
-        ok = telegram_edit_message(active["message_id"], candidate_records)
-        if not ok:
-            return None
-        update_batch_records(active["id"], candidate_records)
-        return active["message_id"]
-
-    close_batch(active["id"])
-    new_records = [record]
-    new_msg_id = telegram_send_new_message(new_records)
-    if new_msg_id is None:
-        return None
-    create_batch(new_msg_id, new_records)
-    log.info("Started fresh Telegram message (msg_id=%s) after character limit", new_msg_id)
-    return new_msg_id
+    close_old_batch(batch["id"])
+    fresh_items = [record]
+    new_msg_id = send_tg_message(fresh_items)
+    if not new_msg_id:
+        return False
+    save_new_batch(new_msg_id, fresh_items)
+    return True
 
 
-def process_pending():
-    pending = get_pending_results()
-    for record in pending:
-        if is_period_already_broadcasted(record["period"]):
-            continue
-        msg_id = append_record_to_telegram(record)
-        if msg_id is None:
+def flush_unsent():
+    for row in get_unsent():
+        if push_record(row):
+            mark_sent(row["period"])
+        else:
             break
-        mark_broadcasted(record["period"], msg_id)
 
-# ================= DATA COLLECTOR =================
+# ================= LOOP & HTTP SERVER =================
 
-def collector_loop():
-    initialized = not database_is_empty()
+def run_loop():
+    ready = has_any_data()
     while True:
         try:
-            results = fetch_game_data()
-            if not results:
-                log.warning("API returned no valid results")
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            if not initialized:
-                seed_initial_history(results)
-                initialized = True
-            else:
-                for record in results:
-                    save_result(record, broadcasted=0)
-                process_pending()
-
+            rows = fetch_results()
+            if rows:
+                if not ready:
+                    seed_old_results(rows)
+                    ready = True
+                else:
+                    for r in rows:
+                        insert_result(r, sent=0)
+                    flush_unsent()
             time.sleep(POLL_INTERVAL)
-        except Exception as error:
-            log.exception("Collector error: %s", error)
+        except Exception as err:
+            log.exception("Loop error: %s", err)
             time.sleep(max(POLL_INTERVAL, 3))
 
-# ================= WEBSITE JSON API =================
 
-class WebsiteHandler(BaseHTTPRequestHandler):
-    def send_json(self, data, status=200):
-        content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        self.send_response(status)
+class Handler(BaseHTTPRequestHandler):
+    def json_resp(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(content)
-
-    def do_OPTIONS(self):
-        self.send_json({"ok": True})
+        self.wfile.write(body)
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        params = urllib.parse.parse_qs(parsed.query)
-
-        if path == "/":
-            return self.send_json({
-                "name": "KHELV DATA HISTORY BOT",
-                "game": "WinGo 1 Minute",
-                "status": "running",
-                "endpoints": ["/api/history", "/api/latest", "/health"]
-            })
-        elif path == "/health":
-            return self.send_json({
-                "status": "ok",
-                "game": "WinGo 1M",
-                "timestamp": int(time.time())
-            })
-        elif path == "/api/latest":
-            records = get_history(1)
-            return self.send_json(records[0] if records else None)
-        elif path == "/api/history":
-            limit = params.get("limit", ["100"])[0]
+        qs = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/health":
+            self.json_resp({"ok": True, "ts": int(time.time())})
+        elif parsed.path == "/api/latest":
+            data = get_latest_list(1)
+            self.json_resp(data[0] if data else None)
+        elif parsed.path == "/api/history":
+            lim = qs.get("limit", ["100"])[0]
             try:
-                limit = int(limit)
+                lim = int(lim)
             except ValueError:
-                limit = 100
-            return self.send_json(get_history(limit))
+                lim = 100
+            self.json_resp(get_latest_list(lim))
         else:
-            return self.send_json({"error": "Endpoint not found"}, 404)
+            self.json_resp({"status": "running"})
 
-    def log_message(self, format, *args):
-        log.info("HTTP: " + format % args)
+    def log_message(self, fmt, *args):
+        log.info("HTTP: " + fmt % args)
 
-# ================= START WEB SERVER =================
 
-def start_web_server():
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), WebsiteHandler)
-    log.info("Website JSON API running on port %s", PORT)
-    server.serve_forever()
+def start_http():
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    log.info("HTTP server listening on :%s", PORT)
+    srv.serve_forever()
 
-# ================= MAIN =================
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("ERROR: Set TELEGRAM_BOT_TOKEN environment variable")
-    if not CHANNEL_ID:
-        raise SystemExit("ERROR: Set TELEGRAM_CHAT_ID environment variable")
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
+    if not CHAT_ID:
+        raise SystemExit("Missing TELEGRAM_CHAT_ID")
 
-    init_database()
-    web_thread = threading.Thread(target=start_web_server, daemon=True)
-    web_thread.start()
-
-    log.info("====================================")
-    log.info("KHELV DATA HISTORY BOT V2.2")
-    log.info("GAME: WinGo 1 Minute")
-    log.info("PREDICTION: DISABLED")
-    log.info("AI: DISABLED")
-    log.info("====================================")
-
-    try:
-        collector_loop()
-    except KeyboardInterrupt:
-        log.info("Bot stopped by user")
+    setup_db()
+    threading.Thread(target=start_http, daemon=True).start()
+    log.info("WinGo 1M History Bot started")
+    run_loop()
 
 
 if __name__ == "__main__":
