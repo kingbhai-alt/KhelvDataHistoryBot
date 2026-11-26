@@ -1,14 +1,14 @@
 
 #!/usr/bin/env python3
 # ============================================================
-# KHELV DATA HISTORY BOT V2.0
+# KHELV DATA HISTORY BOT V3.0
 # WinGo 1 Minute | Telegram JSON Broadcaster
 #
-# AUTO JSON BATCHING
+# MULTI RESULT JSON BATCHING
 # AUTO MESSAGE SPLITTING
 # PERIOD DUPLICATE PROTECTION
 # SQLITE PERSISTENT STORAGE
-# AUTO RETRY
+# AUTOMATIC RETRY
 # WEBSITE JSON API
 #
 # No Prediction | No AI | No Fake Results
@@ -24,7 +24,6 @@ import threading
 import urllib.request
 import urllib.parse
 
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ================= CONFIGURATION =================
@@ -47,13 +46,15 @@ PORT = int(os.getenv("PORT", "8080"))
 
 DB_PATH = os.getenv("DB_PATH", "history.db")
 
-# Telegram safe message size
+# Telegram message safety
 MAX_MESSAGE_CHARS = 3800
 
-# Wait to collect multiple results before sending
-BATCH_FLUSH_SECONDS = 30
+# Collect for 10 minutes before normal sending
+BATCH_MAX_WAIT = int(
+    os.getenv("BATCH_MAX_WAIT", "600")
+)
 
-# Maximum saved history
+# Maximum stored history
 MAX_HISTORY = 5000
 
 HEADERS = {
@@ -71,12 +72,13 @@ log = logging.getLogger("KHELV-DATA-BOT")
 
 db_lock = threading.RLock()
 
-# Monotonic timer for batch collection
 pending_started = None
+
 
 # ================= DATABASE =================
 
 def db_connect():
+
     conn = sqlite3.connect(
         DB_PATH,
         timeout=30
@@ -104,10 +106,13 @@ def init_database():
             )
         """)
 
+        # Enable WAL for safer concurrent database access
+        conn.execute("PRAGMA journal_mode=WAL")
+
         conn.commit()
         conn.close()
 
-    log.info("SQLite database initialized")
+    log.info("Database initialized")
 
 
 # ================= RESULT PROCESSOR =================
@@ -175,9 +180,11 @@ def normalize_result(item):
     period = str(period).strip()
 
     try:
+
         number = int(number)
 
     except (ValueError, TypeError):
+
         return None
 
     if not period or number < 0 or number > 9:
@@ -206,7 +213,9 @@ def normalize_result(item):
         color = get_color(number)
 
     allowed_colors = {
-        "Red", "Green", "Violet"
+        "Red",
+        "Green",
+        "Violet"
     }
 
     if (
@@ -238,6 +247,7 @@ def fetch_game_data():
     ) as response:
 
         if response.status != 200:
+
             raise RuntimeError(
                 f"Game API HTTP {response.status}"
             )
@@ -252,12 +262,12 @@ def fetch_game_data():
 
     for item in raw_list:
 
-        result = normalize_result(item)
+        record = normalize_result(item)
 
-        if result:
-            results.append(result)
+        if record:
+            results.append(record)
 
-    # Oldest to newest
+    # Chronological order
     results.sort(
         key=lambda x: x["period"]
     )
@@ -266,36 +276,6 @@ def fetch_game_data():
 
 
 # ================= DATABASE OPERATIONS =================
-
-def save_result(record, broadcasted=0):
-
-    with db_lock:
-
-        conn = db_connect()
-
-        try:
-
-            cursor = conn.execute("""
-                INSERT OR IGNORE INTO history
-                (period, number, big_small, color, broadcasted)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                record["period"],
-                record["number"],
-                record["big_small"],
-                json.dumps(record["color"]),
-                broadcasted
-            ))
-
-            inserted = cursor.rowcount == 1
-
-            conn.commit()
-
-            return inserted
-
-        finally:
-            conn.close()
-
 
 def database_is_empty():
 
@@ -312,6 +292,43 @@ def database_is_empty():
     return row["total"] == 0
 
 
+def save_result(record, broadcasted=0):
+
+    with db_lock:
+
+        conn = db_connect()
+
+        try:
+
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO history
+                (
+                    period,
+                    number,
+                    big_small,
+                    color,
+                    broadcasted
+                )
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                record["period"],
+                record["number"],
+                record["big_small"],
+                json.dumps(record["color"]),
+                broadcasted
+            ))
+
+            inserted = cursor.rowcount == 1
+
+            conn.commit()
+
+            return inserted
+
+        finally:
+
+            conn.close()
+
+
 def seed_initial_history(results):
 
     count = 0
@@ -322,7 +339,7 @@ def seed_initial_history(results):
             count += 1
 
     log.info(
-        "Initial history saved: %s new records",
+        "Initial history saved: %s records",
         count
     )
 
@@ -334,7 +351,11 @@ def get_pending_results():
         conn = db_connect()
 
         rows = conn.execute("""
-            SELECT period, number, big_small, color
+            SELECT
+                period,
+                number,
+                big_small,
+                color
             FROM history
             WHERE broadcasted = 0
             ORDER BY period ASC
@@ -376,6 +397,7 @@ def mark_broadcasted(periods):
             conn.commit()
 
         finally:
+
             conn.close()
 
 
@@ -391,7 +413,11 @@ def get_history(limit=100):
         conn = db_connect()
 
         rows = conn.execute("""
-            SELECT period, number, big_small, color
+            SELECT
+                period,
+                number,
+                big_small,
+                color
             FROM history
             ORDER BY period DESC
             LIMIT ?
@@ -416,19 +442,25 @@ def cleanup_old_history():
 
         conn = db_connect()
 
-        conn.execute("""
-            DELETE FROM history
-            WHERE period IN (
-                SELECT period
-                FROM history
-                WHERE broadcasted = 1
-                ORDER BY period DESC
-                LIMIT -1 OFFSET ?
-            )
-        """, (MAX_HISTORY,))
+        try:
 
-        conn.commit()
-        conn.close()
+            conn.execute("""
+                DELETE FROM history
+                WHERE broadcasted = 1
+                AND period IN (
+                    SELECT period
+                    FROM history
+                    WHERE broadcasted = 1
+                    ORDER BY period DESC
+                    LIMIT -1 OFFSET ?
+                )
+            """, (MAX_HISTORY,))
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
 
 
 # ================= JSON BATCH BUILDER =================
@@ -474,11 +506,11 @@ def telegram_send(records):
 
     if not BOT_TOKEN:
 
-        log.error("TELEGRAM_BOT_TOKEN is missing")
+        log.error("Bot token missing")
 
         return False
 
-    # Exact JSON array format
+    # Multiple records in ONE JSON array
     message = json.dumps(
         records,
         ensure_ascii=False,
@@ -488,7 +520,7 @@ def telegram_send(records):
     if len(message) > MAX_MESSAGE_CHARS:
 
         log.error(
-            "Message exceeded safe character limit"
+            "Message exceeds safe character limit"
         )
 
         return False
@@ -530,7 +562,7 @@ def telegram_send(records):
         if result.get("ok") is True:
 
             log.info(
-                "Telegram batch sent | Records: %s | Characters: %s",
+                "MESSAGE SENT | Results: %s | Characters: %s",
                 len(records),
                 len(message)
             )
@@ -538,21 +570,21 @@ def telegram_send(records):
             return True
 
         log.error(
-            "Telegram rejected message: %s",
+            "Telegram error: %s",
             result
         )
 
     except Exception as error:
 
         log.error(
-            "Telegram send error: %s",
+            "Telegram send failed: %s",
             error
         )
 
     return False
 
 
-# ================= BATCH BROADCAST PROCESSOR =================
+# ================= AUTO BATCH PROCESSOR =================
 
 def process_pending(force=False):
 
@@ -567,44 +599,64 @@ def process_pending(force=False):
         return
 
     if pending_started is None:
+
         pending_started = time.monotonic()
 
     batches = build_batches(pending)
 
-    first_batch = batches[0]
-
-    first_json = json.dumps(
-        first_batch,
+    # The first batch is ready when its size approaches limit.
+    first_batch_json = json.dumps(
+        batches[0],
         ensure_ascii=False,
         indent=2
     )
 
     size_full = (
-        len(first_json) >= MAX_MESSAGE_CHARS - 100
-        or len(batches) > 1
+        len(first_batch_json) >= MAX_MESSAGE_CHARS - 100
     )
 
-    time_full = (
+    # If several batches are already required,
+    # send them in sequence.
+    multiple_batches = len(batches) > 1
+
+    elapsed = (
         time.monotonic() - pending_started
-        >= BATCH_FLUSH_SECONDS
     )
 
-    if not (force or size_full or time_full):
+    timer_expired = (
+        elapsed >= BATCH_MAX_WAIT
+    )
+
+    if not (
+        force
+        or size_full
+        or multiple_batches
+        or timer_expired
+    ):
+
+        log.debug(
+            "Collecting results: %s records, %s seconds",
+            len(pending),
+            int(elapsed)
+        )
+
         return
 
     log.info(
-        "Starting batch delivery: %s pending results",
-        len(pending)
+        "BATCH READY | Records: %s | Messages: %s",
+        len(pending),
+        len(batches)
     )
 
-    for batch in batches:
+    for index, batch in enumerate(batches, start=1):
 
         success = telegram_send(batch)
 
         if not success:
 
             log.warning(
-                "Batch delivery failed. Keeping records pending."
+                "Batch %s failed. Pending data retained.",
+                index
             )
 
             pending_started = time.monotonic()
@@ -612,20 +664,23 @@ def process_pending(force=False):
             return
 
         periods = [
-            record["period"]
-            for record in batch
+            item["period"]
+            for item in batch
         ]
 
         mark_broadcasted(periods)
 
         log.info(
-            "Broadcast confirmed for %s periods",
-            len(periods)
+            "Batch %s/%s confirmed",
+            index,
+            len(batches)
         )
 
     pending_started = None
 
     cleanup_old_history()
+
+    log.info("All pending batches processed")
 
 
 # ================= DATA COLLECTOR =================
@@ -650,8 +705,8 @@ def collector_loop():
 
             elif not initialized:
 
-                # First startup:
-                # Save existing results without sending them.
+                # First startup: save existing records,
+                # do not send historical records.
                 seed_initial_history(results)
 
                 initialized = True
@@ -662,33 +717,31 @@ def collector_loop():
 
                 for record in results:
 
-                    inserted = save_result(
+                    if save_result(
                         record,
                         broadcasted=0
-                    )
+                    ):
 
-                    if inserted:
                         new_count += 1
 
                 if new_count:
 
                     log.info(
-                        "New unique results collected: %s",
+                        "New unique records: %s",
                         new_count
                     )
 
-            # Check pending data even when API has no new result.
+            # Process pending results on every cycle.
             process_pending()
 
             time.sleep(
                 max(0.5, POLL_INTERVAL)
             )
 
-        except Exception as error:
+        except Exception:
 
             log.exception(
-                "Collector error: %s",
-                error
+                "Collector error"
             )
 
             time.sleep(
@@ -759,7 +812,7 @@ class WebsiteHandler(BaseHTTPRequestHandler):
 
             return self.send_json({
                 "name": "KHELV DATA HISTORY BOT",
-                "version": "2.0",
+                "version": "3.0",
                 "game": "WinGo 1 Minute",
                 "status": "running",
                 "endpoints": [
@@ -778,8 +831,14 @@ class WebsiteHandler(BaseHTTPRequestHandler):
                 stats = conn.execute("""
                     SELECT
                         COUNT(*) AS total,
-                        SUM(CASE WHEN broadcasted = 1 THEN 1 ELSE 0 END) AS sent,
-                        SUM(CASE WHEN broadcasted = 0 THEN 1 ELSE 0 END) AS pending
+                        SUM(
+                            CASE WHEN broadcasted = 1
+                            THEN 1 ELSE 0 END
+                        ) AS sent,
+                        SUM(
+                            CASE WHEN broadcasted = 0
+                            THEN 1 ELSE 0 END
+                        ) AS pending
                     FROM history
                 """).fetchone()
 
@@ -787,6 +846,7 @@ class WebsiteHandler(BaseHTTPRequestHandler):
 
             return self.send_json({
                 "status": "ok",
+                "version": "3.0",
                 "game": "WinGo 1M",
                 "timestamp": int(time.time()),
                 "total_records": stats["total"],
@@ -810,13 +870,15 @@ class WebsiteHandler(BaseHTTPRequestHandler):
             )[0]
 
             try:
+
                 limit = int(limit)
+
             except ValueError:
+
                 limit = 100
 
             records = get_history(limit)
 
-            # Oldest to newest
             records.reverse()
 
             return self.send_json(records)
@@ -844,7 +906,7 @@ def start_web_server():
     )
 
     log.info(
-        "Website JSON API running on port %s",
+        "Website API running on port %s",
         PORT
     )
 
@@ -858,13 +920,13 @@ def main():
     if not BOT_TOKEN:
 
         raise SystemExit(
-            "ERROR: Set TELEGRAM_BOT_TOKEN environment variable"
+            "ERROR: TELEGRAM_BOT_TOKEN missing"
         )
 
     if not CHANNEL_ID:
 
         raise SystemExit(
-            "ERROR: Set TELEGRAM_CHAT_ID environment variable"
+            "ERROR: TELEGRAM_CHAT_ID missing"
         )
 
     init_database()
@@ -877,13 +939,14 @@ def main():
     web_thread.start()
 
     log.info("====================================")
-    log.info("KHELV DATA HISTORY BOT V2.0")
+    log.info("KHELV DATA HISTORY BOT V3.0")
     log.info("GAME: WinGo 1 Minute")
-    log.info("AUTO JSON BATCHING: ON")
+    log.info("AUTO MULTI JSON: ON")
     log.info("MAX MESSAGE: %s", MAX_MESSAGE_CHARS)
-    log.info("BATCH INTERVAL: %s seconds", BATCH_FLUSH_SECONDS)
+    log.info("MAX BATCH WAIT: %s seconds", BATCH_MAX_WAIT)
     log.info("DUPLICATE PROTECTION: ON")
-    log.info("PERSISTENT STORAGE: ON")
+    log.info("SQLITE STORAGE: ON")
+    log.info("AUTO MESSAGE SPLIT: ON")
     log.info("PREDICTION: DISABLED")
     log.info("AI: DISABLED")
     log.info("====================================")
@@ -898,4 +961,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
