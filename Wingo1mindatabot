@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ============================================================
-KHELV DATA HISTORY BOT V2.1
-WinGo 1 Minute | Telegram Formatted History Broadcaster
+KHELV DATA HISTORY BOT V2.2
+WinGo 1 Minute | Clean Rolling History Broadcaster
 No Prediction | No AI | No Fake Results
 Single File Deployment
 ============================================================
@@ -31,10 +31,11 @@ API_URL = os.getenv(
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
 PORT = int(os.getenv("PORT", "8080"))
 DB_PATH = os.getenv("DB_PATH", "history.db")
+RESET_DB = os.getenv("RESET_DB", "0").strip().lower() in ("1", "true", "yes")
 MAX_HISTORY = 5000
 
-# Telegram message limit is 4096 chars; keep safe margin
-MAX_TG_TEXT_LEN = int(os.getenv("MAX_TG_TEXT_LEN", "3900"))
+# Keep safely below Telegram's 4096 character limit
+MAX_TG_TEXT_LEN = int(os.getenv("MAX_TG_TEXT_LEN", "3800"))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Safari/537.36",
@@ -60,6 +61,13 @@ def db_connect():
 
 def init_database():
     with db_lock:
+        if RESET_DB and os.path.exists(DB_PATH):
+            try:
+                os.remove(DB_PATH)
+                log.warning("RESET_DB enabled: removed existing database %s", DB_PATH)
+            except Exception as e:
+                log.error("Failed to remove %s: %s", DB_PATH, e)
+
         conn = db_connect()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS history (
@@ -83,13 +91,12 @@ def init_database():
         """)
         conn.commit()
         conn.close()
-        log.info("SQLite database initialized")
+        log.info("SQLite database initialized (V2.2)")
 
 # ================= RESULT PROCESSOR =================
 
 def get_color(number):
     """
-    Color mapping based on the supplied sample format.
     0 = Red + Violet
     5 = Green + Violet
     """
@@ -341,26 +348,23 @@ def close_batch(batch_id):
 
 # ================= TELEGRAM FORMATTING =================
 
-def format_row(rec):
-    period = str(rec["period"])
-    num = str(rec["number"])
-    size = f"{rec['big_small']:<5}"
+def format_entry(idx, rec):
+    period = html.escape(str(rec["period"]))
+    num = html.escape(str(rec["number"]))
+    size = html.escape(str(rec["big_small"]))
     colors = ", ".join(rec["color"]) if isinstance(rec["color"], list) else str(rec["color"])
-    return f"{period} | {num} | {size} | {colors}"
+    colors_esc = html.escape(colors)
+    return (
+        f"{idx}. Period: <b>{period}</b>\n"
+        f"    Number: <b>{num}</b> | Size: <b>{size}</b> | Color: <b>{colors_esc}</b>"
+    )
 
 
 def format_history_message(records_list):
-    lines = [
-        "WIN GO 1M | RESULT HISTORY",
-        "Period            | Num | Size  | Color",
-        "-----------------------------------------"
-    ]
-    for rec in records_list:
-        lines.append(format_row(rec))
-    lines.append("-----------------------------------------")
-    lines.append(f"Total Entries: {len(records_list)}")
-    body = "\n".join(lines)
-    return "<pre>" + html.escape(body) + "</pre>"
+    header = "<b>WIN GO 1M — LIVE RESULT LOG</b>\n━━━━━━━━━━━━━━━━━━━━━━"
+    entries = [format_entry(i + 1, rec) for i, rec in enumerate(records_list)]
+    footer = f"━━━━━━━━━━━━━━━━━━━━━━\nTotal Records: <b>{len(records_list)}</b>"
+    return header + "\n" + "\n\n".join(entries) + "\n" + footer
 
 
 def tg_api_call(method, payload):
@@ -381,7 +385,6 @@ def telegram_send_new_message(records_list):
         log.error("TELEGRAM_BOT_TOKEN is missing")
         return None
 
-    # No reply_markup / buttons included
     payload = {
         "chat_id": CHANNEL_ID,
         "text": format_history_message(records_list),
@@ -404,7 +407,6 @@ def telegram_edit_message(message_id, records_list):
         log.error("TELEGRAM_BOT_TOKEN is missing")
         return False
 
-    # No reply_markup / buttons included
     payload = {
         "chat_id": CHANNEL_ID,
         "message_id": message_id,
@@ -427,10 +429,6 @@ def telegram_edit_message(message_id, records_list):
 # ================= BROADCAST PROCESSOR =================
 
 def append_record_to_telegram(record):
-    """
-    Appends unique record to active Telegram message while under MAX_TG_TEXT_LEN.
-    Starts a fresh message once limit is reached so results never repeat.
-    """
     active = get_active_batch()
 
     if active is None:
@@ -572,7 +570,7 @@ def main():
     web_thread.start()
 
     log.info("====================================")
-    log.info("KHELV DATA HISTORY BOT V2.1")
+    log.info("KHELV DATA HISTORY BOT V2.2")
     log.info("GAME: WinGo 1 Minute")
     log.info("PREDICTION: DISABLED")
     log.info("AI: DISABLED")
