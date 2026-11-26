@@ -1,0 +1,653 @@
+
+#!/usr/bin/env python3
+# ============================================================
+# KHELV DATA HISTORY BOT V1.0
+# WinGo 1 Minute | Telegram JSON Broadcaster
+# No Prediction | No AI | No Fake Results
+# Single File Deployment
+# ============================================================
+
+import os
+import json
+import time
+import html
+import sqlite3
+import logging
+import threading
+import urllib.request
+import urllib.parse
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ================= CONFIGURATION =================
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9110025108:AAHtWMpg6BkgQ5ri8abKG5C6m42cdulTJZA").strip()
+
+CHANNEL_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    "-1003811055440"
+).strip()
+
+API_URL = os.getenv(
+    "API_URL",
+    "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
+).strip()
+
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
+
+PORT = int(os.getenv("PORT", "8080"))
+
+DB_PATH = os.getenv("DB_PATH", "history.db")
+
+MAX_HISTORY = 5000
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Referer": "https://hgnice.biz",
+    "Accept": "application/json"
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+log = logging.getLogger("KHELV-DATA-BOT")
+
+db_lock = threading.RLock()
+
+# ================= DATABASE =================
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_database():
+    with db_lock:
+        conn = db_connect()
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                period TEXT PRIMARY KEY,
+                number INTEGER NOT NULL,
+                big_small TEXT NOT NULL,
+                color TEXT NOT NULL,
+                broadcasted INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+
+    log.info("SQLite database initialized")
+
+
+# ================= RESULT PROCESSOR =================
+
+def get_color(number):
+    """
+    Color mapping based on the supplied sample format.
+    0 = Red + Violet
+    5 = Green + Violet
+    """
+
+    mapping = {
+        0: ["Red", "Violet"],
+        1: ["Green"],
+        2: ["Red"],
+        3: ["Green"],
+        4: ["Red"],
+        5: ["Green", "Violet"],
+        6: ["Red"],
+        7: ["Green"],
+        8: ["Red"],
+        9: ["Green"]
+    }
+
+    return mapping[number]
+
+
+def extract_api_list(data):
+
+    if isinstance(data, dict):
+
+        if isinstance(data.get("data"), dict):
+            result = data["data"].get("list")
+
+            if isinstance(result, list):
+                return result
+
+        if isinstance(data.get("data"), list):
+            return data["data"]
+
+        if isinstance(data.get("list"), list):
+            return data["list"]
+
+        if isinstance(data.get("result"), list):
+            return data["result"]
+
+    if isinstance(data, list):
+        return data
+
+    return []
+
+
+def normalize_result(item):
+
+    if not isinstance(item, dict):
+        return None
+
+    period = (
+        item.get("issueNumber")
+        or item.get("issue")
+        or item.get("period")
+    )
+
+    number = item.get("number")
+
+    if period is None or number is None:
+        return None
+
+    period = str(period).strip()
+
+    try:
+        number = int(number)
+    except (ValueError, TypeError):
+        return None
+
+    if not period or number < 0 or number > 9:
+        return None
+
+    big_small = "Big" if number >= 5 else "Small"
+
+    # Prefer API color if it is available.
+    raw_color = item.get("color")
+
+    if isinstance(raw_color, list) and raw_color:
+        color = [str(x).strip().capitalize() for x in raw_color]
+    elif isinstance(raw_color, str) and raw_color.strip():
+        color = [
+            x.strip().capitalize()
+            for x in raw_color.replace(",", " ").split()
+        ]
+    else:
+        # Derive color using the supplied sample's mapping.
+        color = get_color(number)
+
+    if not color or any(not x for x in color):
+        return None
+
+    return {
+        "period": period,
+        "number": number,
+        "big_small": big_small,
+        "color": color
+    }
+
+
+# ================= FETCH GAME API =================
+
+def fetch_game_data():
+
+    request = urllib.request.Request(
+        API_URL,
+        headers=HEADERS
+    )
+
+    with urllib.request.urlopen(request, timeout=15) as response:
+
+        if response.status != 200:
+            raise RuntimeError(
+                f"Game API HTTP {response.status}"
+            )
+
+        raw = response.read().decode("utf-8")
+
+        data = json.loads(raw)
+
+    raw_list = extract_api_list(data)
+
+    results = []
+
+    for item in raw_list:
+
+        result = normalize_result(item)
+
+        if result:
+            results.append(result)
+
+    return results
+
+
+# ================= DATABASE OPERATIONS =================
+
+def save_result(record, broadcasted=0):
+
+    with db_lock:
+
+        conn = db_connect()
+
+        cursor = conn.execute("""
+            INSERT OR IGNORE INTO history
+            (period, number, big_small, color, broadcasted)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            record["period"],
+            record["number"],
+            record["big_small"],
+            json.dumps(record["color"]),
+            broadcasted
+        ))
+
+        inserted = cursor.rowcount == 1
+
+        conn.commit()
+        conn.close()
+
+        return inserted
+
+
+def database_is_empty():
+
+    with db_lock:
+
+        conn = db_connect()
+
+        row = conn.execute(
+            "SELECT COUNT(*) AS total FROM history"
+        ).fetchone()
+
+        conn.close()
+
+        return row["total"] == 0
+
+
+def get_pending_results():
+
+    with db_lock:
+
+        conn = db_connect()
+
+        rows = conn.execute("""
+            SELECT period, number, big_small, color
+            FROM history
+            WHERE broadcasted = 0
+            ORDER BY period ASC
+        """).fetchall()
+
+        conn.close()
+
+    return [
+        {
+            "period": row["period"],
+            "number": row["number"],
+            "big_small": row["big_small"],
+            "color": json.loads(row["color"])
+        }
+        for row in rows
+    ]
+
+
+def mark_broadcasted(period):
+
+    with db_lock:
+
+        conn = db_connect()
+
+        conn.execute("""
+            UPDATE history
+            SET broadcasted = 1
+            WHERE period = ?
+        """, (period,))
+
+        conn.commit()
+        conn.close()
+
+
+def seed_initial_history(results):
+
+    """
+    First startup:
+    Save current API history without broadcasting old results.
+    """
+
+    for record in results:
+        save_result(record, broadcasted=1)
+
+    log.info(
+        "Initial history saved: %s records",
+        len(results)
+    )
+
+
+def get_history(limit=100):
+
+    limit = max(1, min(int(limit), MAX_HISTORY))
+
+    with db_lock:
+
+        conn = db_connect()
+
+        rows = conn.execute("""
+            SELECT period, number, big_small, color
+            FROM history
+            ORDER BY period DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+        conn.close()
+
+    return [
+        {
+            "period": row["period"],
+            "number": row["number"],
+            "big_small": row["big_small"],
+            "color": json.loads(row["color"])
+        }
+        for row in rows
+    ]
+
+
+# ================= TELEGRAM =================
+
+def telegram_send(record):
+
+    if not BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN is missing")
+        return False
+
+    # One result per message, in the exact requested JSON shape.
+    message_json = json.dumps(
+        [record],
+        ensure_ascii=False,
+        indent=2
+    )
+
+    message = "<pre>" + html.escape(message_json) + "</pre>"
+
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+
+    url = (
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    )
+
+    body = urllib.parse.urlencode(payload).encode()
+
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        method="POST"
+    )
+
+    try:
+
+        with urllib.request.urlopen(request, timeout=20) as response:
+
+            result = json.loads(
+                response.read().decode("utf-8")
+            )
+
+        if result.get("ok") is True:
+
+            log.info(
+                "Telegram broadcast successful: %s",
+                record["period"]
+            )
+
+            return True
+
+        log.error("Telegram rejected message: %s", result)
+
+    except Exception as error:
+
+        log.error("Telegram send error: %s", error)
+
+    return False
+
+
+# ================= BROADCAST PROCESSOR =================
+
+def process_pending():
+
+    pending = get_pending_results()
+
+    for record in pending:
+
+        success = telegram_send(record)
+
+        if not success:
+            # Keep it pending for retry.
+            break
+
+        mark_broadcasted(record["period"])
+
+
+# ================= DATA COLLECTOR =================
+
+def collector_loop():
+
+    initialized = not database_is_empty()
+
+    while True:
+
+        try:
+
+            results = fetch_game_data()
+
+            if not results:
+
+                log.warning("API returned no valid results")
+
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if not initialized:
+
+                seed_initial_history(results)
+
+                initialized = True
+
+            else:
+
+                # Insert only genuinely new periods.
+                # API normally returns newest first.
+                for record in results:
+
+                    save_result(
+                        record,
+                        broadcasted=0
+                    )
+
+                process_pending()
+
+            time.sleep(POLL_INTERVAL)
+
+        except Exception as error:
+
+            log.exception(
+                "Collector error: %s",
+                error
+            )
+
+            time.sleep(max(POLL_INTERVAL, 3))
+
+
+# ================= WEBSITE JSON API =================
+
+class WebsiteHandler(BaseHTTPRequestHandler):
+
+    def send_json(self, data, status=200):
+
+        content = json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2
+        ).encode("utf-8")
+
+        self.send_response(status)
+
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8"
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*"
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, OPTIONS"
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type"
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(content))
+        )
+
+        self.end_headers()
+
+        self.wfile.write(content)
+
+    def do_OPTIONS(self):
+
+        self.send_json({"ok": True})
+
+    def do_GET(self):
+
+        parsed = urllib.parse.urlparse(self.path)
+
+        path = parsed.path
+
+        params = urllib.parse.parse_qs(
+            parsed.query
+        )
+
+        if path == "/":
+
+            return self.send_json({
+                "name": "KHELV DATA HISTORY BOT",
+                "game": "WinGo 1 Minute",
+                "status": "running",
+                "endpoints": [
+                    "/api/history",
+                    "/api/latest",
+                    "/health"
+                ]
+            })
+
+        elif path == "/health":
+
+            return self.send_json({
+                "status": "ok",
+                "game": "WinGo 1M",
+                "timestamp": int(time.time())
+            })
+
+        elif path == "/api/latest":
+
+            records = get_history(1)
+
+            return self.send_json(
+                records[0] if records else None
+            )
+
+        elif path == "/api/history":
+
+            limit = params.get("limit", ["100"])[0]
+
+            try:
+                limit = int(limit)
+            except ValueError:
+                limit = 100
+
+            return self.send_json(
+                get_history(limit)
+            )
+
+        else:
+
+            return self.send_json({
+                "error": "Endpoint not found"
+            }, 404)
+
+    def log_message(self, format, *args):
+        log.info("HTTP: " + format % args)
+
+
+# ================= START WEB SERVER =================
+
+def start_web_server():
+
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        WebsiteHandler
+    )
+
+    log.info(
+        "Website JSON API running on port %s",
+        PORT
+    )
+
+    server.serve_forever()
+
+
+# ================= MAIN =================
+
+def main():
+
+    if not BOT_TOKEN:
+
+        raise SystemExit(
+            "ERROR: Set TELEGRAM_BOT_TOKEN environment variable"
+        )
+
+    if not CHANNEL_ID:
+
+        raise SystemExit(
+            "ERROR: Set TELEGRAM_CHAT_ID environment variable"
+        )
+
+    init_database()
+
+    web_thread = threading.Thread(
+        target=start_web_server,
+        daemon=True
+    )
+
+    web_thread.start()
+
+    log.info("====================================")
+    log.info("KHELV DATA HISTORY BOT V1.0")
+    log.info("GAME: WinGo 1 Minute")
+    log.info("PREDICTION: DISABLED")
+    log.info("AI: DISABLED")
+    log.info("====================================")
+
+    try:
+
+        collector_loop()
+
+    except KeyboardInterrupt:
+
+        log.info("Bot stopped by user")
+
+
+if __name__ == "__main__":
+    main()
